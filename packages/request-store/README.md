@@ -150,7 +150,10 @@ DB만 두고 비밀번호를 넣지 않는다. URL이나 `password` 쿼리에 �
 `INVALID_CONFIGURATION`으로 거절한다. 다른 `DB_AUTH_MODE` 값도 거절한다.
 이 모드의 결과에는 `connectionString`이 없고 `host`·`port`·`user`·`database`와
 `password` 콜백이 있다. pg가 접속 문자열과 `PGPASSWORD`로 콜백을 덮어쓰기
-때문이다. URL의 나머지 쿼리 키(예: `application_name`)는 같은 이름으로 옮긴다.
+때문이다. URL 쿼리는 허용 목록 `application_name`·`options`만 같은 이름으로
+옮긴다. 그 밖의 키(`connectionString`·`host`·`writesPaused` 등)는 풀 옵션에
+섞여 콜백·TLS·store 동작을 바꿀 수 있어 `INVALID_CONFIGURATION`으로 거절하고,
+메시지에는 값 없이 키 이름만 남긴다.
 테스트는 두 번째 인자 `{signerFactory}`로 서명기를 바꿔 끼울 수 있다.
 
 URL의 `sslmode`는 helper가 제거해 명시적인 검증 설정으로 바꾼다.

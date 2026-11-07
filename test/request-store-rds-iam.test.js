@@ -191,3 +191,64 @@ function restoreEnv(values) {
     }
   }
 }
+
+test('RDS IAM mode forwards only allow-listed URL query keys', () => {
+  const options = postgresOptionsFromEnv({...IAM_ENV, DATABASE_URL:
+    'postgres://app_iam@db.example/demo?application_name=bot&options=-c%20x'},
+  recordingSigner());
+  assert.equal(options.application_name, 'bot');
+  assert.equal(options.options, '-c x');
+  for (const [key, value] of [
+    ['writesPaused', '0'], ['poolFactory', 'x'], ['host', 'other.example'],
+    ['user', 'app_password'], ['statementTimeoutMillis', '1'],
+  ]) {
+    assert.throws(() => postgresOptionsFromEnv({...IAM_ENV,
+      DATABASE_URL: `postgres://app_iam@db.example/demo?${key}=${value}`},
+    recordingSigner()), (error) => {
+      assert.equal(error.code, 'INVALID_CONFIGURATION', key);
+      assert.match(error.message, new RegExp(`\\b${key}\\b`));
+      assert.doesNotMatch(error.message, new RegExp(`=${value}`));
+      return true;
+    });
+  }
+});
+
+test('a nested connectionString query cannot bring back a password login',
+    (t) => {
+      const saved = process.env.PGPASSWORD;
+      t.after(() => restoreEnv({PGPASSWORD: saved}));
+      process.env.PGPASSWORD = 'env-password-must-not-win';
+      for (const nested of [
+        'postgres://app_iam:nested-secret-1@db.example/demo',
+        'postgres://app_iam@db.example/demo',
+        'postgres://app_iam@db.example/demo?sslmode=disable',
+        'postgres://app_iam@db.example/demo?sslmode=no-verify',
+      ]) {
+        let error;
+        try {
+          postgresOptionsFromEnv({...IAM_ENV, DATABASE_URL:
+            'postgres://app_iam@db.example/demo?connectionString=' +
+            encodeURIComponent(nested)}, recordingSigner());
+        } catch (caught) {
+          error = caught;
+        }
+        assert.equal(error?.code, 'INVALID_CONFIGURATION', nested);
+        assert.match(error.message, /connectionString/);
+        assert.doesNotMatch(inspect(error, {showHidden: true, depth: 5}),
+            /nested-secret-1|sslmode/);
+      }
+    });
+
+test('password mode never loads the AWS SDK', () => {
+  const {spawnSync} = require('node:child_process');
+  const script = `
+    const {postgresOptionsFromEnv} = require('./packages/request-store');
+    postgresOptionsFromEnv({DATABASE_URL: 'postgres://user:pass@db/demo'});
+    const loaded = Object.keys(require.cache)
+        .filter((file) => file.includes('@aws-sdk'));
+    process.stdout.write(JSON.stringify(loaded));`;
+  const run = spawnSync(process.execPath, ['-e', script],
+      {cwd: require('node:path').join(__dirname, '..'), encoding: 'utf8'});
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(JSON.parse(run.stdout), []);
+});

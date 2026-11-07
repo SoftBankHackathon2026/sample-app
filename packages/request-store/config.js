@@ -3,6 +3,10 @@ const {RequestStoreError} = require('./request');
 
 const AUTH_MODES = ['password', 'rds-iam'];
 const DEFAULT_POSTGRES_PORT = 5432;
+// URL query keys RDS IAM mode hands to pg. Any other key would land in the
+// pool options, where connectionString, host or store options could replace
+// the token callback, the TLS settings or the store's own behavior.
+const IAM_URL_QUERY_KEYS = ['application_name', 'options'];
 
 function configuration(message) {
   return new RequestStoreError('INVALID_CONFIGURATION', message, 500);
@@ -43,6 +47,22 @@ function decodeUrlPart(part) {
 }
 
 /**
+ * Returns the allow-listed URL query keys as pg options.
+ * @param {!URL} url
+ * @return {!Object<string, string>}
+ */
+function iamQueryOptions(url) {
+  const rejected = [...url.searchParams.keys()].find(
+      (key) => !IAM_URL_QUERY_KEYS.includes(key));
+  if (rejected !== undefined) {
+    // Only the key is named; values may hold credentials or URLs.
+    throw configuration(
+        `RDS IAM mode rejects DATABASE_URL query key ${rejected}`);
+  }
+  return Object.fromEntries(url.searchParams);
+}
+
+/**
  * Builds the AWS SDK RDS signer. Loaded on demand so password mode never
  * pulls in the SDK.
  * @param {{hostname: string, port: number, username: string,
@@ -64,7 +84,8 @@ function awsRdsSigner(config) {
  * @param {!Object<string, string>} env
  * @param {function(!Object): {getAuthToken: function(): !Promise<string>}}
  *     signerFactory
- * @return {!Object} host, port, user, database, URL query keys and password.
+ * @return {!Object} host, port, user, database, allowed query keys and
+ *     password.
  */
 function rdsIamOptions(url, env, signerFactory) {
   if (url.password || url.searchParams.has('password')) {
@@ -77,13 +98,14 @@ function rdsIamOptions(url, env, signerFactory) {
   if (!env.AWS_REGION) {
     throw configuration('RDS IAM mode requires AWS_REGION');
   }
+  const query = iamQueryOptions(url);
+  const database = decodeUrlPart(url.pathname.slice(1));
   const host = url.hostname;
   const port = url.port ? Number(url.port) : DEFAULT_POSTGRES_PORT;
   const signer = signerFactory(
       {hostname: host, port, username: user, region: env.AWS_REGION});
   return {
-    ...Object.fromEntries(url.searchParams),
-    host, port, user, database: decodeUrlPart(url.pathname.slice(1)),
+    ...query, host, port, user, database,
     password: () => signer.getAuthToken(),
   };
 }
