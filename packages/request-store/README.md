@@ -138,6 +138,20 @@ DB 권한 차단을 수행하지 않으며 전환 오케스트레이터를 대�
 | `DB_CONNECT_TIMEOUT_MS` | 3000, 최대 60000 |
 | `DB_STATEMENT_TIMEOUT_MS` | 5000, 최대 60000 |
 | `DB_POOL_MAX` | 5, 최대 100 |
+| `DB_AUTH_MODE` | `password`(기본, URL 비밀번호) 또는 `rds-iam` |
+| `AWS_REGION` | `rds-iam`일 때 필수. 토큰을 서명할 RDS 리전 |
+
+`DB_AUTH_MODE=rds-iam`이면 비밀번호 대신 RDS IAM 인증 토큰으로 로그인한다.
+`@aws-sdk/rds-signer`가 기본 자격 증명 체인(ECS 작업 역할 등)으로 새 연결마다
+토큰을 서명해 pg의 `password` 콜백으로 넘긴다. 토큰 수명은 15분이지만 RDS는
+로그인 때만 확인하므로 열린 연결은 끊기지 않는다. `DATABASE_URL`에는 사용자와
+DB만 두고 비밀번호를 넣지 않는다. URL이나 `password` 쿼리에 비밀번호가 있거나,
+사용자·`AWS_REGION`이 없거나, TLS가 꺼져 있으면 비밀번호로 넘어가지 않고
+`INVALID_CONFIGURATION`으로 거절한다. 다른 `DB_AUTH_MODE` 값도 거절한다.
+이 모드의 결과에는 `connectionString`이 없고 `host`·`port`·`user`·`database`와
+`password` 콜백이 있다. pg가 접속 문자열과 `PGPASSWORD`로 콜백을 덮어쓰기
+때문이다. URL의 나머지 쿼리 키(예: `application_name`)는 같은 이름으로 옮긴다.
+테스트는 두 번째 인자 `{signerFactory}`로 서명기를 바꿔 끼울 수 있다.
 
 URL의 `sslmode`는 helper가 제거해 명시적인 검증 설정으로 바꾼다.
 다른 URL SSL 키는 거절한다. SSL 키는 `ssl`로 시작하는 모든 키(예:

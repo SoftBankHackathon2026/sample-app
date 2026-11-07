@@ -1,6 +1,9 @@
 const {readFileSync} = require('node:fs');
 const {RequestStoreError} = require('./request');
 
+const AUTH_MODES = ['password', 'rds-iam'];
+const DEFAULT_POSTGRES_PORT = 5432;
+
 function configuration(message) {
   return new RequestStoreError('INVALID_CONFIGURATION', message, 500);
 }
@@ -25,8 +28,80 @@ function isUrlTlsKey(name) {
   return key.startsWith('ssl') || key === 'uselibpqcompat';
 }
 
-/** Build explicit TLS settings without URL SSL parameters overriding them. */
-function postgresOptionsFromEnv(env = process.env) {
+/**
+ * Decodes a URL user or database name. URIError would escape the
+ * configuration error contract, so it becomes INVALID_CONFIGURATION.
+ * @param {string} part Percent-encoded URL component.
+ * @return {string}
+ */
+function decodeUrlPart(part) {
+  try {
+    return decodeURIComponent(part);
+  } catch {
+    throw configuration('DATABASE_URL has invalid percent-encoding');
+  }
+}
+
+/**
+ * Builds the AWS SDK RDS signer. Loaded on demand so password mode never
+ * pulls in the SDK.
+ * @param {{hostname: string, port: number, username: string,
+ *     region: string}} config
+ * @return {{getAuthToken: function(): !Promise<string>}}
+ */
+function awsRdsSigner(config) {
+  const {Signer} = require('@aws-sdk/rds-signer');
+  return new Signer(config);
+}
+
+/**
+ * Pool options that authenticate with an RDS IAM token instead of a password.
+ * The URL becomes discrete fields because pg lets a connection string or
+ * PGPASSWORD replace a password callback. Each new connection signs a fresh
+ * token; RDS checks it only at login, so its 15 minute lifetime does not end
+ * open connections.
+ * @param {!URL} url DATABASE_URL without sslmode.
+ * @param {!Object<string, string>} env
+ * @param {function(!Object): {getAuthToken: function(): !Promise<string>}}
+ *     signerFactory
+ * @return {!Object} host, port, user, database, URL query keys and password.
+ */
+function rdsIamOptions(url, env, signerFactory) {
+  if (url.password || url.searchParams.has('password')) {
+    throw configuration('RDS IAM mode rejects a DATABASE_URL password');
+  }
+  const user = decodeUrlPart(url.username);
+  if (!user) {
+    throw configuration('RDS IAM mode requires a DATABASE_URL user');
+  }
+  if (!env.AWS_REGION) {
+    throw configuration('RDS IAM mode requires AWS_REGION');
+  }
+  const host = url.hostname;
+  const port = url.port ? Number(url.port) : DEFAULT_POSTGRES_PORT;
+  const signer = signerFactory(
+      {hostname: host, port, username: user, region: env.AWS_REGION});
+  return {
+    ...Object.fromEntries(url.searchParams),
+    host, port, user, database: decodeUrlPart(url.pathname.slice(1)),
+    password: () => signer.getAuthToken(),
+  };
+}
+
+/**
+ * Build explicit TLS settings without URL SSL parameters overriding them.
+ * DB_AUTH_MODE=rds-iam swaps the URL password for an RDS IAM token callback.
+ * @param {!Object<string, string>=} env
+ * @param {{signerFactory: (function(!Object): {getAuthToken: function():
+ *     !Promise<string>}|undefined)}=} dependencies Signer override for tests.
+ * @return {!Object}
+ */
+function postgresOptionsFromEnv(env = process.env,
+    {signerFactory = awsRdsSigner} = {}) {
+  const authMode = env.DB_AUTH_MODE || 'password';
+  if (!AUTH_MODES.includes(authMode)) {
+    throw configuration('DB_AUTH_MODE must be password or rds-iam');
+  }
   if (!env.DATABASE_URL) {
     throw configuration('DATABASE_URL is required');
   }
@@ -59,8 +134,14 @@ function postgresOptionsFromEnv(env = process.env) {
   } else if (ssl && env.DB_SSL_CA) {
     ssl.ca = env.DB_SSL_CA;
   }
+  if (authMode === 'rds-iam' && !ssl) {
+    throw configuration('RDS IAM mode requires verified TLS');
+  }
+  const target = authMode === 'rds-iam' ?
+      rdsIamOptions(url, env, signerFactory) :
+      {connectionString: url.toString()};
   return {
-    connectionString: url.toString(), ssl,
+    ...target, ssl,
     connectionTimeoutMillis: positiveInteger(env.DB_CONNECT_TIMEOUT_MS, 3000,
         60000),
     statementTimeoutMillis: positiveInteger(env.DB_STATEMENT_TIMEOUT_MS, 5000,
