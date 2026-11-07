@@ -1,6 +1,18 @@
 const express = require('express');
-const {randomUUID} = require('node:crypto');
+const {randomUUID, timingSafeEqual} = require('node:crypto');
 const {normalizeRequest, normalizeId} = require('../../packages/request-store/request');
+
+// Optional bearer token for the control API. Empty token = rely on network policy only.
+function controlAuth(token) {
+  if (!token) return (req, res, next) => next();
+  const expected = Buffer.from(`Bearer ${token}`);
+  return (req, res, next) => {
+    const given = Buffer.from(String(req.headers.authorization || ''));
+    const ok = given.length === expected.length && timingSafeEqual(given, expected);
+    if (!ok) return res.status(401).json({error: 'CONTROL_UNAUTHORIZED'});
+    next();
+  };
+}
 
 // One consumer owns this queue. The lease is also checked by the atomic ACK.
 const ENQUEUE = `
@@ -27,7 +39,7 @@ function problem(code, statusCode = 409) {
 }
 
 async function createIngress({redis, targets, initialTarget = 'onprem',
-  maxRecords = 100000, afterCommit}) {
+  maxRecords = 100000, afterCommit, controlToken}) {
   if (!targets[initialTarget]) throw new Error('initial target missing');
   for (const target of Object.values(targets)) {
     const u = new URL(target.url);
@@ -177,7 +189,7 @@ async function createIngress({redis, targets, initialTarget = 'onprem',
     }
     res.status(202).json({status: 'accepted', request: JSON.parse(row.body)});
   }));
-  const control = express(); control.use(express.json());
+  const control = express(); control.use(controlAuth(controlToken)); control.use(express.json());
   // Server binds this app to loopback only. No Service exposes its port.
   let changing = false;
   const exclusive = (fn) => safe(async (req, res) => {
@@ -219,4 +231,4 @@ async function createIngress({redis, targets, initialTarget = 'onprem',
     });
   }};
 }
-module.exports = {createIngress};
+module.exports = {createIngress, controlAuth};

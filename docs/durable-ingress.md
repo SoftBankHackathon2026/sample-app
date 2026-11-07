@@ -8,7 +8,19 @@
 ```
 
 주소 목록은 운영 설정, 인증값은 Secret 환경변수다. 토큰을 사용하는 대상은 HTTPS만 허용한다.
-앱 API는 8080, 제어 API는 loopback 9092에 바인딩된다. 제어 포트를 Service/Ingress에 공개하지 않는다.
+앱 API는 8080, 제어 API는 기본 loopback 9092에 바인딩된다. 제어 포트를 외부 Service/Ingress에 공개하지 않는다.
+
+제어 API 환경변수 (cutover 도구가 큐를 자동 제어할 때 쓴다):
+
+| 변수 | 기본 | 뜻 |
+|---|---|---|
+| `INGRESS_CONTROL_HOST` | `127.0.0.1` | 제어 API 바인드 주소. `0.0.0.0`은 9092를 러너 파드로만 제한하는 NetworkPolicy와 함께만 쓴다 |
+| `INGRESS_CONTROL_TOKEN` | 없음 | 있으면 제어 API가 `Authorization: Bearer <token>`을 요구한다(401 `CONTROL_UNAUTHORIZED`). 값은 Secret에서만 |
+| `INGRESS_API_PORT` / `INGRESS_CONTROL_PORT` | `8080` / `9092` | 로컬 시험용 포트 변경 |
+
+누가 전환을 결정하나: 이 서비스는 CDC 완료나 DB 차단을 판단하지 않는다. 판단은 `migration.cutover`(Hackathon `migration/`)가 하고,
+설정에 `ingress` 절이 있으면 FENCING에서 `/pause`(settled 확인) → 원본 REVOKE, SWITCHING에서 대상 GRANT → 대상 앱 readiness → `/target` → `/resume` 순으로 호출한다.
+`ingress` 절이 없으면 운영자가 port-forward로 같은 순서를 수동으로 친다.
 
 - POST `/api/requests`: 정규화된 ID·내용을 Redis Stream/AOF에 접수한 뒤 202/accepted.
 - GET `/api/requests/:id`: 처리 중은 202/accepted, 처리 완료는 현재 대상 앱에서 읽은 committed 응답.
