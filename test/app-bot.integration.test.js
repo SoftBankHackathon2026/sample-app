@@ -206,3 +206,34 @@ test('S3 real PG: enforced API commits bot writes only with the Bearer header',
             assert.equal(await countRows(host), '0');
           });
     });
+
+test('bounded generator commits exact rows and stays stopped after restart',
+    {skip: SKIP}, async (t) => {
+      const host = await hostApi(t);
+      const options = {adapter: createHttpAdapter({baseUrl: host.base}),
+        ledgerDir: host.directory, runId: host.runId, generation: 'stopped',
+        ratePerSecond: 100};
+      host.bot = await createTrafficBot(options);
+      host.bot.start();
+      await host.bot.setGeneration(true, {limit: 3});
+      const waitForCommits = async (count) => {
+        const deadline = Date.now() + 5000;
+        while (host.bot.snapshot().committed < count && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        assert.equal(host.bot.snapshot().committed, count);
+      };
+      await waitForCommits(3);
+      assert.equal(await countRows(host), '3');
+      assert.equal(host.bot.snapshot().generation, 'stopped');
+      await host.bot.stop();
+      host.bot = await createTrafficBot({...options, generation: 'running'});
+      host.bot.start();
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assert.equal(await countRows(host), '3');
+      await host.bot.setGeneration(true, {limit: 5});
+      await waitForCommits(5);
+      await host.bot.setGeneration(false);
+      assert.equal(await countRows(host), '5');
+      assert.equal(host.bot.snapshot().pending, 0);
+    });

@@ -85,16 +85,16 @@ test('a stopped generator makes no requests; starting and stopping it switch onl
       assert.equal(bot.snapshot().generation, 'stopped');
       assert.match(bot.metrics(), /traffic_bot_generating 0/);
 
-      assert.equal(bot.setGeneration(true), 'running');
+      assert.equal(await bot.setGeneration(true), 'running');
       assert.ok(await until(() => bot.snapshot().committed >= 3));
 
-      bot.setGeneration(false);
+      await bot.setGeneration(false);
       // Requests already in the ledger still settle after generation stops.
       assert.ok(await until(() => bot.snapshot().pending === 0));
       const settled = store.counts.posts;
       await sleep(300);
       assert.equal(store.counts.posts, settled);
-      assert.throws(() => bot.setGeneration('yes'), TypeError);
+      await assert.rejects(bot.setGeneration('yes'), TypeError);
     });
 
 test('generation option and env values are validated', async (t) => {
@@ -166,4 +166,49 @@ test('CLI without BOT_CONTROL_TOKEN keeps generating and refuses the switch',
         body: '{"enabled":false}'});
       assert.equal(res.status, 403);
       assert.ok(await until(() => store.counts.posts >= 2));
+    });
+
+test('CLI guards ledger identity and acknowledges bounded durable generation',
+    async (t) => {
+      const token = `ctl-${randomUUID()}-${randomUUID()}`;
+      const {base, store} = await runCli(t, {BOT_GENERATION: 'stopped',
+        BOT_CONTROL_TOKEN: token});
+      const status = async () => (await fetch(`${base}/control`)).json();
+      const before = await status();
+      assert.equal(before.control_enabled, true);
+      assert.equal(before.generated_total, 0);
+      assert.equal(before.generation_limit, null);
+      assert.equal(before.paused, false);
+      assert.equal(before.fatal, null);
+      assert.match(before.ledger_id, /^[0-9a-f-]{36}$/);
+      assert.match(before.request_endpoint, /^http:\/\/127.0.0.1:\d+\/api\/requests$/);
+      const post = (body) => fetch(`${base}/control/generation`, {
+        method: 'POST', headers: {authorization: `Bearer ${token}`},
+        body: JSON.stringify(body),
+      });
+      for (const guard of [{expected_run_id: 'wrong'},
+        {expected_ledger_id: 'wrong'}]) {
+        const response = await post({enabled: true, limit: 2, ...guard});
+        assert.equal(response.status, 409);
+        assert.equal((await response.json()).error, 'BOT_IDENTITY_CONFLICT');
+      }
+      for (const limit of [-1, 1.5, '2', null]) {
+        assert.equal((await post({enabled: true, limit})).status, 400);
+      }
+      assert.equal(store.counts.posts, 0);
+      const body = {enabled: true, limit: 3, expected_run_id: RUN_ID,
+        expected_ledger_id: before.ledger_id};
+      assert.equal((await post(body)).status, 200);
+      assert.ok(await until(async () => (await status()).committed === 3));
+      assert.equal((await status()).generation, 'stopped');
+      assert.equal((await status()).generated_total, 3);
+      assert.equal((await post(body)).status, 200);
+      await sleep(100);
+      assert.equal(store.counts.posts, 3);
+      const stale = await post({...body, limit: 2});
+      assert.equal(stale.status, 409);
+      assert.equal((await stale.json()).error,
+          'GENERATION_LIMIT_BELOW_GENERATED');
+      assert.equal((await post({enabled: false})).status, 200);
+      assert.equal((await status()).generation, 'stopped');
     });
