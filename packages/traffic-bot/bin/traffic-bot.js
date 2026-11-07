@@ -3,6 +3,8 @@ const {createServer} = require('node:http');
 const {createTrafficBot, createHttpAdapter} = require('..');
 const {DEFAULT_MAX_RECORDS, DEFAULT_MAX_LEDGER_BYTES} = require('../ledger');
 const {LOCK_ERROR_CODES} = require('../owner-lock');
+const {createControlRoutes, readControlToken, readInitialGeneration} =
+  require('../control-api');
 
 const MIN_API_TOKEN_LENGTH = 32;
 /** RFC 6750 2.1 b64token: 1*( ALPHA / DIGIT / "-._~+/" ) *"=". */
@@ -11,7 +13,8 @@ const B64TOKEN_PATTERN = /^[A-Za-z0-9\-._~+/]+=*$/;
 const LOOPBACK_HOSTNAMES = ['127.0.0.1', '[::1]'];
 /** Safe startup codes; they never carry the token or the URL. */
 const CONFIG_ERROR_CODES = ['BOT_API_TOKEN_INVALID',
-  'INSECURE_TOKEN_TRANSPORT'];
+  'INSECURE_TOKEN_TRANSPORT', 'BOT_CONTROL_TOKEN_INVALID',
+  'BOT_GENERATION_INVALID'];
 
 function configError(code) {
   const error = new Error(code);
@@ -74,13 +77,17 @@ async function main(env = process.env) {
   const port = numeric(env, 'BOT_METRICS_PORT', 9091);
   if (port > 65535) throw new Error('Invalid BOT_METRICS_PORT');
   const headers = authHeaders(env);
+  const controlToken = readControlToken(env);
+  const generation = readInitialGeneration(env);
+  const ratePerSecond = numeric(env, 'BOT_RATE', 1, false);
   const bot = await createTrafficBot({
     adapter: createHttpAdapter({baseUrl: env.BOT_BASE_URL,
       requestsPath: env.BOT_REQUESTS_PATH || '/api/requests', headers}),
     ledgerDir: env.BOT_LEDGER_DIR || './data/ledger',
-    ratePerSecond: numeric(env, 'BOT_RATE', 1, false),
+    ratePerSecond,
     runId: env.BOT_RUN_ID,
     phase: env.BOT_PHASE || 'onprem_live',
+    generation,
     maxPending: numeric(env, 'BOT_MAX_PENDING', 1000),
     maxRecords: numeric(env, 'BOT_MAX_RECORDS', DEFAULT_MAX_RECORDS),
     maxLedgerBytes: numeric(env, 'BOT_MAX_LEDGER_BYTES',
@@ -92,7 +99,10 @@ async function main(env = process.env) {
     onSummary: (summary) =>
       process.stdout.write(`${JSON.stringify(summary)}\n`),
   });
+  const handleControl = createControlRoutes({bot, token: controlToken,
+    ratePerSecond, runId: env.BOT_RUN_ID});
   const server = createServer((req, res) => {
+    if (handleControl(req, res)) return;
     if (req.url === '/metrics') {
       res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
       return res.end(bot.metrics());

@@ -47,11 +47,29 @@ node packages/traffic-bot/bin/traffic-bot.js
 | `BOT_REQUEST_TIMEOUT_MS` | `5000` | 각 write/read 호출 제한 |
 | `BOT_RETRY_DELAY_MS` | `1000` | 재시도 최소 대기 |
 | `BOT_API_TOKEN` | 없음 | 저장 API Bearer 토큰. 없으면 인증 헤더 없이 보냄. 아래 절 참고 |
+| `BOT_GENERATION` | `running` | 시작 직후 새 요청을 만들지(`running`) 말지(`stopped`). 아래 "생성 켜고 끄기" 참고 |
+| `BOT_CONTROL_TOKEN` | 없음 | 생성 스위치(`POST /control/generation`) Bearer 토큰. 없으면 스위치는 403 |
 
 요약은 1초마다 JSON으로 stdout에 출력합니다. `pending`, `committed`,
 `failed`, `unknown`, 시도/오류 수, 최근 1000개 커밋 지연 p95/p99/최대,
 환경별 커밋 확인 비율을 포함합니다. 환경 비율은 이 프로세스에서 확인한 값입니다.
 커밋 지연은 전송 시간뿐 아니라 최초 생성부터 대기·재시도까지 포함합니다.
+
+## 생성 켜고 끄기
+
+시연하지 않을 때 봇을 멈춰 DB 가 계속 커지지 않게 하는 스위치입니다. metrics 포트에 있습니다.
+
+| 경로 | 동작 |
+| --- | --- |
+| `GET /control` | `{generation, pending, committed, failed, rate_per_second, run_id}` |
+| `POST /control/generation` | 본문 `{"enabled": true\|false}`, `Authorization: Bearer <BOT_CONTROL_TOKEN>` |
+
+- 끄면 **새 요청만** 만들지 않습니다. 장부에 이미 있는 요청은 계속 보내고 확인합니다.
+  기존 `pause()`(배달 일시정지)와 다릅니다 — 그쪽은 생성은 계속하고 보내기만 멈춥니다.
+- 다시 켜면 같은 장부·run_id 로 요청 번호가 이어집니다.
+- 스위치 상태는 메모리에만 있습니다. 재시작하면 `BOT_GENERATION` 값으로 돌아갑니다.
+- `BOT_CONTROL_TOKEN` 이 없으면 스위치는 403 이라 기존 배포 동작이 바뀌지 않습니다.
+  토큰은 `BOT_API_TOKEN` 과 같은 형식(32자 이상 b64token)입니다.
 
 ## API 토큰
 
