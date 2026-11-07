@@ -88,7 +88,7 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
   maxPending = 1000, maxRecords = DEFAULT_MAX_RECORDS,
   maxLedgerBytes = DEFAULT_MAX_LEDGER_BYTES, maxRequestAgeMs = 300000,
   maxAttempts = 20, requestTimeoutMs = 5000, retryDelayMs = 1000, runId,
-  phase = 'onprem_live', onSummary = () => {}} = {}) {
+  phase = 'onprem_live', generation = 'running', onSummary = () => {}} = {}) {
   if (!adapter || typeof adapter.write !== 'function' ||
       typeof adapter.read !== 'function') {
     throw new TypeError('adapter.write and adapter.read are required');
@@ -109,6 +109,9 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
   if (typeof phase !== 'string' || !phase || phase.length > 100) {
     throw new TypeError('phase must be a bounded nonempty string');
   }
+  if (generation !== 'running' && generation !== 'stopped') {
+    throw new TypeError('generation must be running or stopped');
+  }
   const ledger = await openLedger({dir: ledgerDir, maxPending, maxRecords,
     maxLedgerBytes, runId});
   try {
@@ -121,6 +124,9 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
   }
   let stopped = false;
   let paused = false;
+  // Stopping generation only stops new requests; delivery keeps settling the
+  // ledger so a stopped bot leaves nothing pending behind.
+  let generating = generation === 'running';
   let running = false;
   let processing;
   let loop;
@@ -143,6 +149,7 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
     if (finalSnapshot) return structuredClone(finalSnapshot);
     return {
       at: new Date().toISOString(), paused, running,
+      generation: generating ? 'running' : 'stopped',
       ...ledger.summary(),
       ...counters, fatal: fatalCode,
       latency_ms: {p95: percentile(latencies, 0.95),
@@ -403,6 +410,13 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
       if (processing) await processing;
     },
     resume() { paused = false; },
+    setGeneration(enabled) {
+      if (typeof enabled !== 'boolean') {
+        throw new TypeError('enabled must be a boolean');
+      }
+      generating = enabled;
+      return generating ? 'running' : 'stopped';
+    },
     start() {
       if (running || stopped) throw new Error('bot already started or stopped');
       running = true;
@@ -411,10 +425,13 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
         while (!stopped && running) {
           const started = Date.now();
           try {
-            if (ledger.summary().pending >= maxPending) {
-              counters.generation_blocked++;
-            } else {
-              await generate();
+            // A stopped generator only skips this tick; delivery has its own loop.
+            if (generating) {
+              if (ledger.summary().pending >= maxPending) {
+                counters.generation_blocked++;
+              } else {
+                await generate();
+              }
             }
           } catch (error) {
             if (error.code === 'PENDING_LIMIT') {
@@ -477,6 +494,8 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
           `{environment=${label(environment)}} ${count}`),
         '# TYPE traffic_bot_paused gauge',
         `traffic_bot_paused ${paused ? 1 : 0}`,
+        '# TYPE traffic_bot_generating gauge',
+        `traffic_bot_generating ${generating ? 1 : 0}`,
       ];
       return `${lines.join('\n')}\n`;
     },
