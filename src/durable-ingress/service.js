@@ -39,7 +39,10 @@ function problem(code, statusCode = 409) {
 }
 
 async function createIngress({redis, targets, initialTarget = 'onprem',
-  maxRecords = 100000, afterCommit, controlToken}) {
+  maxRecords = 100000, concurrency = 10, afterCommit, controlToken}) {
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 10) {
+    throw new Error('concurrency must be an integer from 1 to 10');
+  }
   if (!targets[initialTarget]) throw new Error('initial target missing');
   for (const target of Object.values(targets)) {
     const u = new URL(target.url);
@@ -54,6 +57,7 @@ async function createIngress({redis, targets, initialTarget = 'onprem',
   }
   let mode = 'paused';
   let active = null;
+  let inFlight = 0;
   let closed = false;
   let leased = true;
   let lastError = null;
@@ -90,7 +94,7 @@ async function createIngress({redis, targets, initialTarget = 'onprem',
   async function controlState() {
     await assertOwner();
     return {...await redis.hGetAll('ingress:control'),
-      mode, in_flight: active ? 1 : 0, last_error: lastError};
+      mode, in_flight: inFlight, concurrency, last_error: lastError};
   }
   async function invoke(method, id, body) {
     const targetName = await redis.hGet('ingress:control', 'target');
@@ -111,12 +115,26 @@ async function createIngress({redis, targets, initialTarget = 'onprem',
     await assertOwner();
     if (mode !== 'running') return;
     let rows = await redis.sendCommand(['XREADGROUP', 'GROUP', 'delivery', 'single',
-      'COUNT', '1', 'STREAMS', 'ingress:inbox', '0']);
+      'COUNT', String(concurrency), 'STREAMS', 'ingress:inbox', '0']);
     if (!rows?.[0]?.[1]?.length) rows = await redis.sendCommand([
-      'XREADGROUP', 'GROUP', 'delivery', 'single', 'COUNT', '1',
+      'XREADGROUP', 'GROUP', 'delivery', 'single', 'COUNT', String(concurrency),
       'STREAMS', 'ingress:inbox', '>']);
     if (!rows?.[0]?.[1]?.length) return;
-    const [entry, fields] = rows[0][1][0];
+    // One reader owns the whole batch: pending IDs cannot be scheduled twice.
+    // Wait for every outcome before pause/target/close can finish.
+    if (mode !== 'running') return;
+    const results = await Promise.allSettled(rows[0][1].map(async (row) => {
+      inFlight++;
+      try { await deliverOne(row); }
+      finally { inFlight--; }
+    }));
+    const errors = results.filter((r) => r.status === 'rejected').map((r) => r.reason);
+    const fatal = errors.find((e) => ['CONTENT_CONFLICT', 'APP_HTTP_409', 'LEASE_LOST'].includes(e.code));
+    if (fatal || errors.length) throw fatal || errors[0];
+    lastError = null;
+  }
+  async function deliverOne([entry, fields]) {
+    await assertOwner();
     const id = fields[1];
     const body = await redis.hGet('ingress:req:' + id, 'body');
     const posted = await invoke('POST', null, body);
@@ -130,7 +148,6 @@ async function createIngress({redis, targets, initialTarget = 'onprem',
     if (!await redis.eval(ACK, {keys: ['ingress:req:' + id], arguments: [owner, entry]})) {
       throw problem('LEASE_LOST', 503);
     }
-    lastError = null;
   }
   function tick() {
     if (closed || mode !== 'running' || active) return active;

@@ -193,3 +193,12 @@ CI는 실제 PostgreSQL 시험을 통과한 커밋만 amd64·arm64로 빌드하�
 - [Notion 근거](docs/spec-sources.md)
 - [프로젝트 하네스 프로필](.claude/harness/project-profile.md)
 - [하네스 정본](https://github.com/xodbs1021/kty-claude-harness-template)
+## 접수 큐 전달 동시성
+
+durable-ingress는 기본 최대 10건을 동시에 전달한다. `INGRESS_CONCURRENCY`는 1~10의 정수이며,
+1로 설정하면 직렬 전달로 되돌릴 수 있다. 각 요청의 POST → GET 내용 확인 → Redis ACK 순서는 유지한다.
+요청 사이 완료 순서는 보장하지 않으며, 같은 ID의 재시도는 앱의 기존 중복 방지 계약을 사용한다.
+일부 실패 시 성공한 요청은 ACK하고 실패한 ID만 pending으로 남긴다.
+`/pause`와 종료는 진행 중인 배치 전체가 끝날 때까지 기다리며, target 전환은 pause 완료 뒤에만 가능하다.
+제어 `/status`의 `in_flight`는 실제 진행 요청 수(0~10), `concurrency`는 설정 상한이다.
+앱의 PostgreSQL 풀 크기는 별도 설정이며, 동시 전달 10건이 처리량 10배를 보장하지는 않는다.
