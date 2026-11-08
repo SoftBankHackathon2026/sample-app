@@ -43,6 +43,7 @@ jobs:
       - run: npm test
         env:
           TEST_REDIS_URL: redis://localhost:6379
+          DEMO_TEST_REDIS_URL: redis://localhost:6379/15
       - run: npm run test:integration
         env:
           TEST_DATABASE_URL: postgres://ghost_test:ghost_test@localhost:5432/ghost_test
