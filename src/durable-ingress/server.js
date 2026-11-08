@@ -1,4 +1,5 @@
 const express = require('express');
+const {once} = require('node:events');
 const {createClient} = require('redis');
 const {createIngress, controlAuth} = require('./service');
 
@@ -43,14 +44,24 @@ async function main() {
       '0.0.0.0');
   const control = app.control.listen(
       Number(process.env.INGRESS_CONTROL_PORT || 9092), controlHost);
-  process.once('SIGTERM', async () => {
+  await Promise.all([once(api, 'listening'), once(control, 'listening')]);
+  return async () => {
     api.close();
     control.close();
     await app.close();
     await redis.quit();
-  });
+  };
 }
-main().catch(() => {
+// Install shutdown handling before Redis initialization can acquire its lease.
+// A stop during startup must finish initialization, then release that lease.
+const initialized = main();
+process.once('SIGTERM', () => {
+  initialized.then((close) => close()).catch(() => {
+    console.error('INGRESS_STOP_FAILED');
+    process.exitCode = 1;
+  });
+});
+initialized.catch(() => {
   console.error('INGRESS_START_FAILED');
   process.exit(1);
 });
