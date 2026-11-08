@@ -88,6 +88,14 @@ async function openLedger({dir, maxPending = 1000,
         db.exec('COMMIT');
       } catch (e) { db.exec('ROLLBACK'); throw e; }
     }
+    const identity = db.prepare(
+        "SELECT value FROM metadata WHERE key='ledger_id'").get();
+    if (!identity) {
+      db.prepare('INSERT INTO metadata(key,value) VALUES(?,?)')
+          .run('ledger_id', JSON.stringify(randomUUID()));
+    } else if (!/^[0-9a-f-]{36}$/.test(JSON.parse(identity.value))) {
+      throw new Error('invalid ledger identity');
+    }
     // Prevent old binaries from silently reading stale JSON after conversion.
     // Backup and marker are durable before the first new SQLite mutation.
     if (stat) {
@@ -139,6 +147,10 @@ async function openLedger({dir, maxPending = 1000,
   if (bytes > maxLedgerBytes) {
     db.close(); await lock.release(); throw new Error('ledger size limit exceeded');
   }
+  const metadataGet = db.prepare('SELECT value FROM metadata WHERE key=?');
+  const metadataSet = db.prepare(
+      'INSERT INTO metadata(key,value) VALUES(?,?) ' +
+      'ON CONFLICT(key) DO UPDATE SET value=excluded.value');
   const save = db.prepare('INSERT INTO entries(id,body) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body');
   function checkOpen() {
     if (closed) throw new Error('ledger is closed');
@@ -176,6 +188,21 @@ async function openLedger({dir, maxPending = 1000,
   return {
     entries() { return db.prepare('SELECT body FROM entries ORDER BY rowid').all().map(r => JSON.parse(r.body)); },
     summary() { return {...counts}; },
+    metadata(key) {
+      checkOpen();
+      const row = metadataGet.get(key);
+      return row ? JSON.parse(row.value) : undefined;
+    },
+    setMetadata(key, value) {
+      const body = JSON.stringify(value);
+      const operation = queue.then(async () => {
+        checkOpen();
+        await lock.assertHeld();
+        metadataSet.run(key, body);
+      });
+      queue = operation.catch(() => {});
+      return operation;
+    },
     pendingEntries() { return structuredClone([...pending.values()]); },
     add(request) {
       return mutate(() => {

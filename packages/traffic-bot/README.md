@@ -47,7 +47,7 @@ node packages/traffic-bot/bin/traffic-bot.js
 | `BOT_REQUEST_TIMEOUT_MS` | `5000` | 각 write/read 호출 제한 |
 | `BOT_RETRY_DELAY_MS` | `1000` | 재시도 최소 대기 |
 | `BOT_API_TOKEN` | 없음 | 저장 API Bearer 토큰. 없으면 인증 헤더 없이 보냄. 아래 절 참고 |
-| `BOT_GENERATION` | `running` | 시작 직후 새 요청을 만들지(`running`) 말지(`stopped`). 아래 "생성 켜고 끄기" 참고 |
+| `BOT_GENERATION` | `running` | 새 run의 초기 생성 상태. 저장된 제어 상태가 있으면 그 상태를 복원 |
 | `BOT_CONTROL_TOKEN` | 없음 | 생성 스위치(`POST /control/generation`) Bearer 토큰. 없으면 스위치는 403 |
 
 요약은 1초마다 JSON으로 stdout에 출력합니다. `pending`, `committed`,
@@ -61,13 +61,27 @@ node packages/traffic-bot/bin/traffic-bot.js
 
 | 경로 | 동작 |
 | --- | --- |
-| `GET /control` | `{generation, pending, committed, failed, rate_per_second, run_id}` |
-| `POST /control/generation` | 본문 `{"enabled": true\|false}`, `Authorization: Bearer <BOT_CONTROL_TOKEN>` |
+| `GET /control` | 생성 상태·누적 건수·`run_id`·`ledger_id`·요청 목적지 |
+| `POST /control/generation` | `enabled`(boolean), 선택 `limit`·`expected_run_id`·`expected_ledger_id`, Bearer 인증 |
 
 - 끄면 **새 요청만** 만들지 않습니다. 장부에 이미 있는 요청은 계속 보내고 확인합니다.
   기존 `pause()`(배달 일시정지)와 다릅니다 — 그쪽은 생성은 계속하고 보내기만 멈춥니다.
 - 다시 켜면 같은 장부·run_id 로 요청 번호가 이어집니다.
-- 스위치 상태는 메모리에만 있습니다. 재시작하면 `BOT_GENERATION` 값으로 돌아갑니다.
+- 생성 상태와 상한은 SQLite에 저장합니다. 성공 응답은 진행 중 생성과 저장이
+  끝난 뒤 반환하며, 재시작해도 정지 상태를 유지합니다. `BOT_GENERATION`은
+  저장된 제어 상태가 없는 run의 초기값입니다.
+- `limit`은 해당 run의 누적 생성 번호 상한입니다. 0 이상의 안전한 정수이며,
+  현재 `generated_total`보다 작으면 409로 거절합니다. 도달하면 자동 정지하고,
+  같은 상한 재요청은 추가 요청을 만들지 않습니다. 생략하면 기존 상한을 유지합니다.
+- `expected_run_id`·`expected_ledger_id`가 현재 상태와 다르면 409로 거절합니다.
+  러너는 두 값을 저장해 장부 초기화나 다른 봇으로의 잘못된 재시도를 감지합니다.
+- `GET /control`은 `generated_total`, `generation_limit`(무제한이면 null),
+  `generation`, `pending`, `accepted_pending`, `committed`, `failed`, `unknown`,
+  `paused`, `fatal`, `control_enabled`, `run_id`, `ledger_id`, `rate_per_second`,
+  `request_endpoint`를 제공합니다. 생성 번호는 현재 run 기준이고 결과 건수는
+  보존된 장부 전체 기준입니다. 목적지에는 인증정보·query·fragment가 없습니다.
+- 이전 완료 시 `enabled=false`를 보내고 `generation=stopped`, `pending=0`을
+  확인합니다. Pod와 조회 API는 유지되며 기존 요청 결과 확인은 계속됩니다.
 - `BOT_CONTROL_TOKEN` 이 없으면 스위치는 403 이라 기존 배포 동작이 바뀌지 않습니다.
   토큰은 `BOT_API_TOKEN` 과 같은 형식(32자 이상 b64token)입니다.
 
@@ -117,6 +131,8 @@ void bot.start();
 // await bot.pause(): HTTP 전송을 정지하고 진행 중 배치를 기다린다.
 // 정지 중 새 요청은 ledger 대기열에 쌓인다.
 // bot.resume(): 대기한 요청부터 처리한다.
+// await bot.setGeneration(true, {limit: 100}): 누적 100건까지 생성.
+// await bot.setGeneration(false): 생성 정지를 영속 저장, 기존 요청은 처리.
 // await bot.stop(): 진행 중 호출 중단, ledger flush, 소유 잠금 해제.
 ```
 

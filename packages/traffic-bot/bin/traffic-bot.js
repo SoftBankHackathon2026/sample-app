@@ -80,9 +80,13 @@ async function main(env = process.env) {
   const controlToken = readControlToken(env);
   const generation = readInitialGeneration(env);
   const ratePerSecond = numeric(env, 'BOT_RATE', 1, false);
+  const requestsPath = env.BOT_REQUESTS_PATH || '/api/requests';
+  const adapter = createHttpAdapter({baseUrl: env.BOT_BASE_URL,
+    requestsPath, headers});
+  const requestEndpoint = new URL(requestsPath.replace(/\/$/, ''),
+      env.BOT_BASE_URL).href;
   const bot = await createTrafficBot({
-    adapter: createHttpAdapter({baseUrl: env.BOT_BASE_URL,
-      requestsPath: env.BOT_REQUESTS_PATH || '/api/requests', headers}),
+    adapter,
     ledgerDir: env.BOT_LEDGER_DIR || './data/ledger',
     ratePerSecond,
     runId: env.BOT_RUN_ID,
@@ -100,7 +104,7 @@ async function main(env = process.env) {
       process.stdout.write(`${JSON.stringify(summary)}\n`),
   });
   const handleControl = createControlRoutes({bot, token: controlToken,
-    ratePerSecond, runId: env.BOT_RUN_ID});
+    ratePerSecond, runId: env.BOT_RUN_ID, requestEndpoint});
   const server = createServer((req, res) => {
     if (handleControl(req, res)) return;
     if (req.url === '/metrics') {

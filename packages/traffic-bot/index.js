@@ -127,6 +127,9 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
   // Stopping generation only stops new requests; delivery keeps settling the
   // ledger so a stopped bot leaves nothing pending behind.
   let generating = generation === 'running';
+  let generationLimit = null;
+  let generationQueue = Promise.resolve();
+  const generationKey = `generation_control:${runId}`;
   let running = false;
   let processing;
   let loop;
@@ -136,6 +139,29 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
     entry.request.run_id === runId).reduce((last, entry) =>
       BigInt(entry.request.request_no) > last ?
         BigInt(entry.request.request_no) : last, 0n);
+  try {
+    if (generated > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw codedError('GENERATED_COUNT_UNSAFE');
+    }
+    const saved = ledger.metadata(generationKey);
+    if (saved !== undefined) {
+      if (typeof saved.enabled !== 'boolean' ||
+          (saved.limit !== null && (!Number.isSafeInteger(saved.limit) ||
+            saved.limit < Number(generated)))) {
+        throw codedError('GENERATION_CONTROL_CORRUPT');
+      }
+      generating = saved.enabled;
+      generationLimit = saved.limit;
+    }
+    if (generationLimit !== null && Number(generated) >= generationLimit) {
+      generating = false;
+    }
+    await ledger.setMetadata(generationKey,
+        {enabled: generating, limit: generationLimit});
+  } catch (error) {
+    await ledger.close();
+    throw error;
+  }
   const controllers = new Set();
   const counters = {write_attempts: 0, write_errors: 0, read_attempts: 0,
     read_errors: 0, generation_errors: 0, generation_blocked: 0};
@@ -150,6 +176,8 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
     return {
       at: new Date().toISOString(), paused, running,
       generation: generating ? 'running' : 'stopped',
+      generated_total: Number(generated), generation_limit: generationLimit,
+      run_id: runId, ledger_id: ledger.metadata('ledger_id'),
       ...ledger.summary(),
       ...counters, fatal: fatalCode,
       latency_ms: {p95: percentile(latencies, 0.95),
@@ -387,12 +415,31 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
     await ledger.add(validateRequest(request));
   }
 
+  function serializeGeneration(action) {
+    const operation = generationQueue.then(action);
+    generationQueue = operation.catch(() => {});
+    return operation;
+  }
+
+  async function saveGeneration(enabled, limit) {
+    await ledger.setMetadata(generationKey, {enabled, limit});
+    generating = enabled;
+    generationLimit = limit;
+  }
+
   async function generate() {
+    if (!generating || stopped) return;
+    if (generated >= BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw codedError('GENERATED_COUNT_UNSAFE');
+    }
     const sequence = generated + 1n;
     await enqueue({request_id: randomUUID(), run_id: runId, phase,
       request_no: String(sequence), payload: `synthetic-${sequence}`,
       created_at: new Date().toISOString()});
     generated = sequence;
+    if (generationLimit !== null && Number(generated) >= generationLimit) {
+      await saveGeneration(false, generationLimit);
+    }
   }
 
   function report() {
@@ -410,12 +457,24 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
       if (processing) await processing;
     },
     resume() { paused = false; },
-    setGeneration(enabled) {
+    async setGeneration(enabled, {limit} = {}) {
       if (typeof enabled !== 'boolean') {
         throw new TypeError('enabled must be a boolean');
       }
-      generating = enabled;
-      return generating ? 'running' : 'stopped';
+      if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0)) {
+        throw new TypeError('limit must be a nonnegative safe integer');
+      }
+      return serializeGeneration(async () => {
+        if (stopped) throw codedError('BOT_STOPPED');
+        const nextLimit = limit === undefined ? generationLimit : limit;
+        if (nextLimit !== null && nextLimit < Number(generated)) {
+          throw codedError('GENERATION_LIMIT_BELOW_GENERATED');
+        }
+        const nextEnabled = enabled &&
+          (nextLimit === null || Number(generated) < nextLimit);
+        await saveGeneration(nextEnabled, nextLimit);
+        return generating ? 'running' : 'stopped';
+      });
     },
     start() {
       if (running || stopped) throw new Error('bot already started or stopped');
@@ -430,7 +489,7 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
               if (ledger.summary().pending >= maxPending) {
                 counters.generation_blocked++;
               } else {
-                await generate();
+                await serializeGeneration(generate);
               }
             }
           } catch (error) {
@@ -511,6 +570,7 @@ async function createTrafficBot({adapter, ledgerDir, ratePerSecond = 1,
       if (loop) await loop;
       if (deliveryLoop) await deliveryLoop;
       if (processing) await processing;
+      await generationQueue;
       finalSnapshot = snapshot();
       await ledger.close();
     },
