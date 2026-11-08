@@ -59,3 +59,8 @@ node --test test/traffic-bot-accepted.test.js test/traffic-bot-retry.test.js tes
 전용 Redis 제어 통합 테스트 1 통과. 처음 Linux 실행의 IPv6 loopback 부재 실패는
 IPv6 loopback을 활성화한 컨테이너에서 재실행해 해결했다. macOS의 flock 부재는
 기존 봇 구현의 실행 전제로, Linux에서 검증했다.
+
+## 접수서비스 자체를 클라우드로 이전하기
+
+앱 전달 대상만 바꾸는 전환과 별도로, 접수서비스와 Redis 요청 기록을
+다른 호스트로 옮기는 절차는 [접수서비스 인계](receipt-handoff.md)를 따른다.
