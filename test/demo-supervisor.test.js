@@ -36,6 +36,11 @@ async function command(action, cycle, token = TOKEN) {
   });
   return {status: r.status, body: await r.json()};
 }
+async function successfulCommand(action, cycle) {
+  const response = await command(action, cycle);
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  return response.body;
+}
 async function processFixture(t, env) {
   const child = spawn(
     process.execPath,
@@ -113,9 +118,9 @@ test(
     });
     assert.equal((await command('stop', null, 'wrong')).status, 401);
     assert.equal((await command('reset', 'demo_1')).status, 409);
-    assert.equal((await command('stop')).status, 200);
+    await successfulCommand('stop');
     assert.equal(await redis.exists('ingress:owner'), 0);
-    assert.equal((await command('reset', 'demo_1')).status, 200);
+    await successfulCommand('reset', 'demo_1');
     assert.equal(await redis.get('demo:archive:demo_1:ingress:ledger'), old);
     assert.equal(
       await redis.hGet('demo:archive:demo_1:ingress:req:fixture', 'body'),
@@ -125,19 +130,19 @@ test(
     proc = await processFixture(t, env);
     assert.equal((await command('status')).body.child_running, false);
     assert.equal((await command('start', 'wrong')).status, 409);
-    assert.equal((await command('start', 'demo_1')).status, 200);
+    await successfulCommand('start', 'demo_1');
     await wait(() => redis.get('ingress:ledger'));
     assert.notEqual(await redis.get('ingress:ledger'), old);
     assert.equal(await redis.hGet('ingress:control', 'target'), 'onprem');
     assert.equal(await redis.hGet('ingress:control', 'mode'), 'paused');
-    await command('stop');
-    await command('reset', 'demo_2');
-    assert.equal((await command('start', 'demo_2')).status, 200);
+    await successfulCommand('stop');
+    await successfulCommand('reset', 'demo_2');
+    await successfulCommand('start', 'demo_2');
     await wait(() => redis.get('ingress:ledger'));
-    await command('stop');
+    await successfulCommand('stop');
     assert.equal((await command('reset', 'demo_1')).status, 409);
-    assert.equal((await command('reset', 'demo_3')).status, 200);
-    assert.equal((await command('start', 'demo_3')).status, 200);
+    await successfulCommand('reset', 'demo_3');
+    await successfulCommand('start', 'demo_3');
     await proc.stop();
   },
 );
@@ -162,18 +167,49 @@ test('real bot changes its ledger and run ID per cycle without generating reques
     return response.ok && response.json();
   }
   const old = await wait(snapshot);
-  await command('stop');
-  await command('reset', 'bot_demo_1');
-  await command('start', 'bot_demo_1');
+  await successfulCommand('stop');
+  await successfulCommand('reset', 'bot_demo_1');
+  await successfulCommand('start', 'bot_demo_1');
   const first = await wait(snapshot);
   assert.equal(first.run_id, 'bot_demo_1');
   assert.notEqual(first.ledger_id, old.ledger_id);
   assert.equal(first.generation, 'stopped');
-  await command('stop');
-  await command('reset', 'bot_demo_2');
-  await command('start', 'bot_demo_2');
+  await successfulCommand('stop');
+  await successfulCommand('reset', 'bot_demo_2');
+  await successfulCommand('start', 'bot_demo_2');
   const second = await wait(snapshot);
   assert.equal(second.run_id, 'bot_demo_2');
   assert.notEqual(second.ledger_id, first.ledger_id);
+  await proc.stop();
+});
+
+test('stop during receipt startup waits for initialization and releases the owner lease',
+    {skip: !process.env.DEMO_TEST_REDIS_URL}, async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'demo-ingress-start-'));
+  t.after(() => fs.rm(root, {recursive: true, force: true}));
+  const marker = path.join(root, 'started');
+  const release = path.join(root, 'release');
+  const redis = createClient({url: process.env.DEMO_TEST_REDIS_URL});
+  redis.on('error', () => {});
+  await redis.connect();
+  t.after(() => redis.quit());
+  await redis.flushDb();
+  const proc = await processFixture(t, {
+    DEMO_RESET_ENABLED: 'true', DEMO_ROLE: 'source',
+    INGRESS_CONTROL_TOKEN: TOKEN, REDIS_URL: process.env.DEMO_TEST_REDIS_URL,
+    INGRESS_TARGETS: JSON.stringify({onprem: {url: 'http://127.0.0.1:19999'}}),
+    NODE_OPTIONS: '--require ./test/fixtures/ingress-delayed-startup.js',
+    DEMO_TEST_START_MARKER: marker, DEMO_TEST_RELEASE_MARKER: release,
+  });
+  await wait(async () => { await fs.access(marker); return true; });
+  assert.equal(await redis.exists('ingress:owner'), 1);
+  const stopped = command('stop');
+  await wait(async () => JSON.parse(await redis.get('demo:supervisor')).stopped);
+  await delay(100); // Keep initialization blocked while SIGTERM is delivered.
+  await fs.writeFile(release, 'continue');
+  assert.equal((await stopped).status, 200);
+  assert.equal(await redis.exists('ingress:owner'), 0);
+  const reset = await command('reset', 'startup_demo');
+  assert.equal(reset.status, 200, JSON.stringify(reset.body));
   await proc.stop();
 });
